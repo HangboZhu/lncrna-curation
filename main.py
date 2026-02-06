@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import argparse
+from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -14,6 +16,9 @@ client = OpenAI(
 
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3-flash")
 VERIFIER_JSON_MODE = os.getenv("VERIFIER_JSON_MODE", "false").strip().lower() in {"1", "true", "yes"}
+CURATOR_PROMPT_MODE = os.getenv("CURATOR_PROMPT_MODE", "compact").strip().lower()
+VERIFIER_PROMPT_MODE = os.getenv("VERIFIER_PROMPT_MODE", "compact").strip().lower()
+VERIFIER_CONDITIONAL = os.getenv("VERIFIER_CONDITIONAL", "true").strip().lower() in {"1", "true", "yes"}
 
 # ==============================================================================
 # 1. 完整版 Agent A (Curator) 提示词 - 严禁修改，保留所有细节
@@ -120,6 +125,34 @@ CURATOR_SYSTEM_PROMPT = """
 ("GAS5", Gene Symbol)
 """
 
+# 简化版 Curator 提示词（保留关键规则）
+CURATOR_SYSTEM_PROMPT_COMPACT = """
+# Role
+你是生物医药文献审编专家，基于 INPUT 做 NER，并输出 checked 字符串。
+
+# Output Format
+1. 字符串格式：("实体名称", 实体类型), ("实体名称", 实体类型)
+2. 无实体输出 null
+3. 多实体用逗号分隔
+
+# Entity Definitions (9 Classes)
+1. Gene Symbol: lncRNA 基因名（官方名称），排除 Gene ID
+2. Organ: 器官（血管也算）
+3. Tissue: 组织（血液算）
+4. Cell: 细胞类型
+5. Species: 物种（patients 不算）
+6. Disease: 疾病
+7. Regulator: 直接调控 lncRNA 的具体分子，排除泛化词
+8. Target: lncRNA 调控的下游分子
+9. Functional Mechanism: 功能机制（如 ceRNA 等）
+
+# Rules
+1. 同一实体只能一种类型
+2. 必须标注嵌套实体（复合词内的子实体也要标）
+3. 标注最小完整名词短语，去掉无意义前缀
+4. 必须与原文完全一致（大小写一致）
+"""
+
 # ==============================================================================
 # 2. 完整版 Agent B (Verifier) 提示词 - 针对性检查规则
 # ==============================================================================
@@ -159,6 +192,21 @@ VERIFIER_SYSTEM_PROMPT = """
 }
 
 必须只输出 JSON，不要附加解释、不要使用代码块。
+"""
+
+VERIFIER_SYSTEM_PROMPT_COMPACT = """
+你是质检员，仅检查 Curator 的标注是否符合规则。
+
+Checklist:
+1) 复合词嵌套实体是否漏标（如 neocortical tissues 需同时标 neocortical、tissues）
+2) 禁止标注 Patient；禁止把 Gene ID 当 Gene Symbol；禁止泛化 Regulator
+3) 血管=Organ；血液=Tissue
+4) 标注文本必须在原文中完全匹配（含大小写），不要输出解释或代码块
+
+输出 JSON：
+{"status":"PASS|FAIL","reason":"若 FAIL 说明具体漏标/错标"}
+
+必须只输出 JSON。
 """
 
 JSON_REPAIR_SYSTEM_PROMPT = """
@@ -216,6 +264,25 @@ def repair_verifier_json(raw_text: str):
     repaired = call_llm(repair_messages, json_mode=False)
     return parse_json_robust(repaired)
 
+def _select_curator_prompt():
+    return CURATOR_SYSTEM_PROMPT_COMPACT if CURATOR_PROMPT_MODE == "compact" else CURATOR_SYSTEM_PROMPT
+
+def _select_verifier_prompt():
+    return VERIFIER_SYSTEM_PROMPT_COMPACT if VERIFIER_PROMPT_MODE == "compact" else VERIFIER_SYSTEM_PROMPT
+
+def _needs_verifier(input_text: str, curated_output: str) -> bool:
+    if not VERIFIER_CONDITIONAL:
+        return True
+    # 复合词/多词实体/典型触发词：存在空格的实体或输入中出现常见复合结构
+    if curated_output and " " in curated_output:
+        return True
+    if input_text:
+        lowered = input_text.lower()
+        trigger_terms = [" cancer", " tissues", " cells", " subpopulation", " lymph", " blood", " vessel", " vascular"]
+        if any(t in lowered for t in trigger_terms):
+            return True
+    return False
+
 def run_dual_agent_system(input_json, max_retries=3):
     """
     运行双智能体循环系统
@@ -225,7 +292,7 @@ def run_dual_agent_system(input_json, max_retries=3):
     
     # 初始化 Curator 的对话历史
     curator_messages = [
-        {"role": "system", "content": CURATOR_SYSTEM_PROMPT},
+        {"role": "system", "content": _select_curator_prompt()},
         {"role": "user", "content": f"Task Input JSON: {json.dumps(input_json, ensure_ascii=False)}\n\n请分析 INPUT 字段，输出 checked 结果字符串。"}
     ]
 
@@ -240,6 +307,10 @@ def run_dual_agent_system(input_json, max_retries=3):
         current_checked_result = current_checked_result.replace("```markdown", "").replace("```", "").strip()
         print(f"🤖 Curator 输出: {current_checked_result}")
 
+        if not _needs_verifier(input_text, current_checked_result):
+            print("⚡ 跳过 Verifier（未检测到嵌套/复合词触发条件）")
+            return current_checked_result
+
         # 2. Verifier 工作
         verifier_content = f"""
         Original Input: "{input_text}"
@@ -249,7 +320,7 @@ def run_dual_agent_system(input_json, max_retries=3):
         """
         
         verifier_messages = [
-            {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
+            {"role": "system", "content": _select_verifier_prompt()},
             {"role": "user", "content": verifier_content}
         ]
         
@@ -280,37 +351,62 @@ def run_dual_agent_system(input_json, max_retries=3):
     print("⚠️ 达到最大重试次数，返回最后一次的结果。")
     return current_checked_result
 
+def process_file(input_path: str, output_path: str, max_retries=3):
+    in_path = Path(input_path)
+    out_path = Path(output_path)
+    data = json.loads(in_path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Input JSON must be a list of records")
+
+    total = len(data)
+    for idx, item in enumerate(data, start=1):
+        print(f"\n================ 处理记录 {idx}/{total} ================")
+        result = run_dual_agent_system(item, max_retries=max_retries)
+        item["check_myself"] = result
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
 # ==============================================================================
 # 主程序
 # ==============================================================================
 if __name__ == "__main__":
-    # 使用你提供的准确数据格式
-    # 注意：这里的 checked 字段是空的，或者包含旧数据。Agent 的任务是生成新的准确数据。
-    
-    # 案例 A: 简单的 GAS5 例子 (你提供的数据)
-    test_data_1 = {
-        "INPUT": "The relative GAS5 expression level in samples with rs55829688 CT/TT genotype was significantly higher than that in samples with CC genotype (Fig. 1E , p < 0.05).",
-        "type": "paper",
-        "ref": "title: Association between polymorphism in the promoter region of lncRNA GAS5 and the risk of colorectal cancer@Yajie Wang",
-        "OUTPUT": "(\"GAS5\", Gene Symbol)",
-        "gt_r": "(\"GAS5\", Gene Symbol)",
-        "checked": "" 
-    }
+    parser = argparse.ArgumentParser(description="Run curation on a JSON list file")
+    parser.add_argument("-i", "--input", help="Input JSON file path")
+    parser.add_argument("-o", "--output", help="Output JSON file path")
+    parser.add_argument("--max-retries", type=int, default=3, help="Max retries per record")
+    args = parser.parse_args()
 
-    # 案例 B: 复杂的嵌套实体例子 (用来测试 Agent B 是否能纠正 Agent A 的遗漏)
-    test_data_2 = {
-        "INPUT": "We demonstrated that LOC646329, a lncRNA that appears low in human neocortical tissues but high in the radial glia subpopulation.",
-        "type": "paper",
-        "ref": "test_ref",
-        "OUTPUT": "null", 
-        "gt_r": "null",
-        "checked": ""
-    }
+    if args.input and args.output:
+        process_file(args.input, args.output, max_retries=args.max_retries)
+    else:
+        # 使用你提供的准确数据格式
+        # 注意：这里的 checked 字段是空的，或者包含旧数据。Agent 的任务是生成新的准确数据。
+        
+        # 案例 A: 简单的 GAS5 例子 (你提供的数据)
+        test_data_1 = {
+            "INPUT": "The relative GAS5 expression level in samples with rs55829688 CT/TT genotype was significantly higher than that in samples with CC genotype (Fig. 1E , p < 0.05).",
+            "type": "paper",
+            "ref": "title: Association between polymorphism in the promoter region of lncRNA GAS5 and the risk of colorectal cancer@Yajie Wang",
+            "OUTPUT": "(\"GAS5\", Gene Symbol)",
+            "gt_r": "(\"GAS5\", Gene Symbol)",
+            "checked": "" 
+        }
 
-    print("\n================ 测试案例 1 (GAS5) ================")
-    final_result_1 = run_dual_agent_system(test_data_1)
-    print(f"\n🎯 最终结果 1: {final_result_1}")
+        # 案例 B: 复杂的嵌套实体例子 (用来测试 Agent B 是否能纠正 Agent A 的遗漏)
+        test_data_2 = {
+            "INPUT": "We demonstrated that LOC646329, a lncRNA that appears low in human neocortical tissues but high in the radial glia subpopulation.",
+            "type": "paper",
+            "ref": "test_ref",
+            "OUTPUT": "null", 
+            "gt_r": "null",
+            "checked": ""
+        }
 
-    print("\n================ 测试案例 2 (Nested Entities) ================")
-    final_result_2 = run_dual_agent_system(test_data_2)
-    print(f"\n🎯 最终结果 2: {final_result_2}")
+        print("\n================ 测试案例 1 (GAS5) ================")
+        final_result_1 = run_dual_agent_system(test_data_1)
+        print(f"\n🎯 最终结果 1: {final_result_1}")
+
+        print("\n================ 测试案例 2 (Nested Entities) ================")
+        final_result_2 = run_dual_agent_system(test_data_2)
+        print(f"\n🎯 最终结果 2: {final_result_2}")
