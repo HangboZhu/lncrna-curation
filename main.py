@@ -351,18 +351,36 @@ def run_dual_agent_system(input_json, max_retries=3):
     print("⚠️ 达到最大重试次数，返回最后一次的结果。")
     return current_checked_result
 
-def process_file(input_path: str, output_path: str, max_retries=3):
+def process_file(input_path: str, output_path: str, max_retries=3, save_every=10):
     in_path = Path(input_path)
     out_path = Path(output_path)
     data = json.loads(in_path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError("Input JSON must be a list of records")
 
+    # Resume support: if output exists and length matches, reuse check_myself by index
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text(encoding="utf-8"))
+            if isinstance(existing, list) and len(existing) == len(data):
+                for i in range(len(data)):
+                    if "check_myself" in existing[i]:
+                        data[i]["check_myself"] = existing[i]["check_myself"]
+        except Exception:
+            pass
+
     total = len(data)
     for idx, item in enumerate(data, start=1):
+        if item.get("check_myself"):
+            print(f"\n================ 处理记录 {idx}/{total} ================\n⏭️ 已有 check_myself，跳过")
+            continue
         print(f"\n================ 处理记录 {idx}/{total} ================")
         result = run_dual_agent_system(item, max_retries=max_retries)
         item["check_myself"] = result
+        if save_every and idx % save_every == 0:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"💾 已保存进度: {idx}/{total}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -375,10 +393,11 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--input", help="Input JSON file path")
     parser.add_argument("-o", "--output", help="Output JSON file path")
     parser.add_argument("--max-retries", type=int, default=3, help="Max retries per record")
+    parser.add_argument("--save-every", type=int, default=10, help="Save progress every N records")
     args = parser.parse_args()
 
     if args.input and args.output:
-        process_file(args.input, args.output, max_retries=args.max_retries)
+        process_file(args.input, args.output, max_retries=args.max_retries, save_every=args.save_every)
     else:
         # 使用你提供的准确数据格式
         # 注意：这里的 checked 字段是空的，或者包含旧数据。Agent 的任务是生成新的准确数据。
